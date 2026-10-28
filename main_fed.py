@@ -9,7 +9,7 @@ import swanlab
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 from models.Update import LocalUpdate_FedAvg
-from models.Nets import ResNet50, VGG16
+from models.Nets import ResNet50, ResNet18, ResNet8, ResNet18Cifar, VGG16
 from models.Fed import Aggregation
 from models.test import test_img
 from utils.get_dataset import get_dataset
@@ -87,7 +87,8 @@ if __name__ == '__main__':
     swanlab.init(
         project="DecFus",
         name=f"{args.algorithm}_{args.dataset}_{args.model}_{args.noniid_case}_{args.data_beta}",
-        config=args.__dict__
+        config=args.__dict__,
+        mode="local",  # no cloud account on the cluster -- log locally instead (./swanlog)
     )
 
     set_random_seed(args.seed)
@@ -96,8 +97,16 @@ if __name__ == '__main__':
 
     if args.model == 'resnet50':
         net_glob = ResNet50(args=args)
+    elif args.model == 'resnet18':
+        net_glob = ResNet18(args=args)
+    elif args.model == 'resnet8':
+        net_glob = ResNet8(args=args)
+    elif args.model == 'resnet18_cifar':
+        net_glob = ResNet18Cifar(args=args)
     elif args.model == 'vgg':
         net_glob = VGG16(args=args)
+    else:
+        exit('Error: unrecognized model {!r}'.format(args.model))
 
     net_glob.to(args.device)
     print(net_glob)

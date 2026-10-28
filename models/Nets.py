@@ -238,3 +238,125 @@ class ImprovedBottleneck(nn.Module):
         out = self.relu(out)
 
         return out
+
+
+class BasicBlock(nn.Module):
+    """Standard ResNet-18/34 basic block (He et al. 2016) -- two plain 3x3 convs,
+    no bottleneck/channel-reduction, no grouping (unlike ImprovedBottleneck above,
+    which is specific to the Bottleneck-style architectures this repo's ResNet50
+    uses). Added so ResNet18 below can reuse ResNet4's stem/bn_final/dropout/fc
+    exactly as-is, isolating "block type + depth" as the only thing that changes
+    relative to this repo's own ResNet50."""
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+def ResNet18(args):
+    num_block = [2, 2, 2, 2]
+    return ResNet4(args, BasicBlock, num_block, num_classes=args.num_classes)
+
+
+class CifarResNet(nn.Module):
+    """Canonical CIFAR ResNet (BasicBlock), kept bit-for-bit architecturally
+    identical to `decfus/models/resnet_small.py` in the decfus-reproduced repo so
+    that cross-codebase experiments isolate the DFL algorithm rather than the
+    network. Deliberately NOT built on ResNet4 above: ResNet4 carries this repo's
+    own customisations (32-channel stem, extra bn_final/relu_final, dropout
+    before fc) which the other codebase does not have.
+
+    Returns the same dict interface the rest of this repo expects ('output').
+    """
+
+    def __init__(self, args, stage_blocks, stage_channels, num_classes=10):
+        super(CifarResNet, self).__init__()
+        assert len(stage_blocks) == len(stage_channels)
+        self.stage_blocks = tuple(stage_blocks)
+        self.stage_channels = tuple(stage_channels)
+
+        self.inplanes = stage_channels[0]
+        self.conv1 = nn.Conv2d(args.num_channels, stage_channels[0], kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(stage_channels[0])
+        self.relu = nn.ReLU(inplace=True)
+
+        for k, (blocks, planes) in enumerate(zip(stage_blocks, stage_channels)):
+            stride = 1 if k == 0 else 2
+            setattr(self, 'layer{}'.format(k + 1), self._make_layer(planes, blocks, stride))
+        self.num_stages = len(stage_blocks)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(stage_channels[-1] * BasicBlock.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _make_layer(self, planes, blocks, stride):
+        downsample = None
+        out_planes = planes * BasicBlock.expansion
+        if stride != 1 or self.inplanes != out_planes:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, out_planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_planes),
+            )
+        layers = [BasicBlock(self.inplanes, planes, stride, downsample)]
+        self.inplanes = out_planes
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(self.inplanes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        result = {}
+        x = self.relu(self.bn1(self.conv1(x)))
+        for k in range(1, self.num_stages + 1):
+            x = getattr(self, 'layer{}'.format(k))(x)
+            result['activation{}'.format(k)] = x
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        result['representation'] = x
+        x = self.fc(x)
+        result['output'] = x
+        return result
+
+
+def ResNet8(args):
+    return CifarResNet(args, stage_blocks=(1, 1, 1), stage_channels=(16, 32, 64),
+                       num_classes=args.num_classes)
+
+
+def ResNet18Cifar(args):
+    return CifarResNet(args, stage_blocks=(2, 2, 2, 2), stage_channels=(64, 128, 256, 512),
+                       num_classes=args.num_classes)
