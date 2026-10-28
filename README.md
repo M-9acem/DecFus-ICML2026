@@ -1,5 +1,36 @@
 # DecFus
 
+> ### Note on this fork
+>
+> This is a fork of [Ublgod/DecFus-ICML2026](https://github.com/Ublgod/DecFus-ICML2026),
+> modified to run a set of two-cluster topology experiments. It is **not** the
+> authors' reference implementation — use upstream for that.
+>
+> **With no new flags, behaviour is unchanged from upstream.** The original
+> aggregation was moved verbatim into `standard_aggregate()` so the additions
+> below could sit beside it; the default path through it is the authors' code.
+>
+> Added here, and **not** part of the published method:
+>
+> | Addition | Flag | Notes |
+> |---|---|---|
+> | ResNet-8, CIFAR ResNet-18 | `--model resnet8` / `resnet18_cifar` | upstream shipped VGG16 and its own ResNet-50 variant only |
+> | Bridge and two-cluster topologies | `--topology bridge` / `two_cluster` | upstream hardcodes a single fixed 10-client graph |
+> | Restricted layer exchange | `--layer_policy first_<k>` / `last_<k>` | upstream has no notion of a logical layer; it iterates raw `state_dict` entries. Layers here are entries grouped by parent module, ordered by forward execution |
+> | Hybrid aggregation | `--hybrid` | plain averaging within clusters, DecFus fusion only across the hub-to-hub bridge |
+>
+> Caveats worth knowing before reusing any of this:
+>
+> - `--layer_scope` accepts only `all`. The averaging branch mixes over every
+>   neighbour at once, so restricting a single edge would mean rebuilding that
+>   average rather than skipping a tensor; it raises instead of guessing.
+> - `--hybrid` averages intra-cluster with an **unweighted mean** (as upstream's
+>   `DFLAvg` does), not the sample-count weighting DecFus's own averaging branch
+>   uses. Different rule, deliberately chosen, worth stating when comparing.
+> - Results produced with `--hybrid` or `--layer_policy` should not be described
+>   as results of the authors' code.
+> - No checkpoint/resume: a requeued job restarts from round 0.
+
 Code for **DecFus: Decentralized Layer-wise Fusion with Dynamic Exploration and Exploitation** (ICML 2026).
 
 Most Decentralized Federated Learning (DFL) methods rely on parameter averaging, which explores the loss landscape insufficiently, while exchanging layers among clients explores more but makes training unstable. **Decentralized Layer-wise Fusion (DecFus)** unifies layer-level exchange (exploration) and averaging (exploitation), and dynamically moves training from an exploration-dominant phase to an exploitation-dominant phase, guided by the loss variance among connected neighbors.
