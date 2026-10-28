@@ -33,6 +33,15 @@ def args_parser():
     parser.add_argument('--verbose', action='store_true', help='verbose print')
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: 1)')
     parser.add_argument("--test_round", type=int, default=5)
+    parser.add_argument('--topology', type=str, default='fixed',
+                        choices=['fixed', 'bridge', 'two_cluster'],
+                        help="communication graph for the decentralized algorithms (DecFus/DFLAvg/DFLMR): "
+                             "'fixed' is this repo's original hardcoded 10-client graph (every client "
+                             "degree 4); 'bridge' is a two-cluster topology -- clients 1,2 are hubs "
+                             "(degree 5: 4 same-cluster leaves + one hub-hub bridge edge), clients 3-6 "
+                             "are hub-1's leaves (degree 1), clients 7-10 are hub-2's leaves (degree 1) "
+                             "-- added to test whether this topology's known failure mode in our own "
+                             "reproduction reproduces against the authors' own implementation.")
 
     # DFLMR arguments
     parser.add_argument("--first_stage_bound", type=int, default=0)
@@ -56,6 +65,18 @@ def args_parser():
                         help='fraction of total rounds over which the sigmoid decay completes once stability is detected')
     parser.add_argument("--variance_reference_start_ratio", type=float, default=0.1)
     parser.add_argument("--variance_reference_end_ratio", type=float, default=0.2)
+    parser.add_argument('--layer_policy', type=str, default='full',
+                        help="restricted layer exchange: 'full', 'first_<k>' or 'last_<k>'. "
+                             "Logical layers are state_dict entries grouped by their parent "
+                             "module and ordered by forward execution, matching the "
+                             "decfus-reproduced repo's `module` granularity exactly.")
+    parser.add_argument('--layer_scope', type=str, default='all', choices=['all'],
+                        help="which edges the layer restriction applies to. Only 'all' is "
+                             "implemented here; the reproduced repo also supports 'bridge'.")
+    parser.add_argument('--hybrid', action='store_true',
+                        help='experiment family B: plain averaging inside each cluster, with '
+                             'DecFus fusion applied only on the hub-to-hub bridge edge. '
+                             'Requires --topology two_cluster.')
     parser.add_argument('--exchange_prob', type=float, default=0.4,
                         help='probability that a low-similarity parameter is taken from the least similar neighbor')
 

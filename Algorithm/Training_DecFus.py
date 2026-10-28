@@ -154,6 +154,320 @@ def adaptive_sigmoid_threshold_decay(current_round, args, stability_detector):
     return current_threshold
 
 
+def build_bridge_topology(n: int) -> dict:
+    """Two-cluster "bridge" topology (1-indexed client ids, matching this repo's
+    convention), for any even n >= 4. Clients 1,2 are hubs (degree
+    leaves_per_hub+1); clients 3..n are leaves (degree 1), split evenly between
+    the two hubs. Mirrors our own reproduction's
+    decfus/topology/registry.py:bridge_topology(n) node-for-node."""
+    if n < 4 or n % 2 != 0:
+        raise ValueError(f"build_bridge_topology needs an even n >= 4, got {n}")
+    leaves_per_hub = (n - 2) // 2
+    hub_a, hub_b = 1, 2
+    leaves_a = list(range(3, 3 + leaves_per_hub))
+    leaves_b = list(range(3 + leaves_per_hub, n + 1))
+
+    topo = {hub_a: [hub_b] + leaves_a, hub_b: [hub_a] + leaves_b}
+    for leaf in leaves_a:
+        topo[leaf] = [hub_a]
+    for leaf in leaves_b:
+        topo[leaf] = [hub_b]
+    return topo
+
+
+def build_two_cluster_topology(n=20):
+    """Two equal star clusters joined by a single hub-to-hub bridge
+    (1-indexed client ids, this repo's convention).
+
+    Each cluster is a pure star: every non-hub client is a degree-1 leaf wired
+    only to its own hub, with no intra-cluster connections between leaves. The
+    two hubs are joined by the single bridge edge, so every cross-cluster path
+    must traverse both hubs.
+
+    For n=20: Cluster A = 1..10 (hub 1, leaves 2..10), Cluster B = 11..20
+    (hub 11, leaves 12..20), bridge 1<->11. Matches
+    `decfus/topology/registry.py:two_cluster(n)` in the decfus-reproduced repo
+    node-for-node after a +1 index shift.
+    """
+    if n < 8 or n % 4 != 0:
+        raise ValueError("build_two_cluster_topology needs n divisible by 4 and >= 8, got {}".format(n))
+    half = n // 2
+    cluster_a = list(range(1, half + 1))
+    cluster_b = list(range(half + 1, n + 1))
+    hub_a, hub_b = cluster_a[0], cluster_b[0]
+    leaves_a, leaves_b = cluster_a[1:], cluster_b[1:]
+
+    adj = {i: set() for i in range(1, n + 1)}
+
+    def add(i, j):
+        adj[i].add(j)
+        adj[j].add(i)
+
+    for hub, leaves in ((hub_a, leaves_a), (hub_b, leaves_b)):
+        for leaf in leaves:
+            add(hub, leaf)
+    add(hub_a, hub_b)  # the bridge: the only inter-cluster edge
+
+    topo = {i: sorted(adj[i]) for i in range(1, n + 1)}
+    meta = {
+        'clusters': dict([(i, 'A') for i in cluster_a] + [(i, 'B') for i in cluster_b]),
+        'roles': dict(
+            [(i, 'leaf') for i in leaves_a + leaves_b]
+            + [(hub_a, 'hub'), (hub_b, 'hub')]
+        ),
+        'hubs': [hub_a, hub_b],
+        'leaves': leaves_a + leaves_b,
+        'bridge': (hub_a, hub_b),
+        'cluster_members': {'A': cluster_a, 'B': cluster_b},
+        'tracked': {'hub_A': hub_a, 'hub_B': hub_b,
+                    'leaf_A': leaves_a[-1], 'leaf_B': leaves_b[-1]},
+    }
+    return topo, meta
+
+
+def build_layer_groups(param_keys):
+    """Group this repo's flat state_dict keys into logical layers.
+
+    This repo has no notion of a "layer" -- it iterates raw state_dict entries,
+    so a BatchNorm's weight/bias/running_mean/running_var are four independent
+    things. The restricted-exchange experiments need a layer concept, and it has
+    to be *the same* concept the decfus-reproduced repo uses or "first 3 layers"
+    would mean different things in the two codebases.
+
+    Mirrors LayerPartition's `module` granularity: group by the state_dict key's
+    parent scope (everything up to the last '.'). Non-floating buffers such as
+    num_batches_tracked are excluded from exchange entirely, as they are there.
+
+    Returns (layer_names_sorted, key_to_layer) where layer_names_sorted is the
+    alphabetical grouping order -- depth order is applied separately.
+    """
+    key_to_layer = {}
+    for key in param_keys:
+        if 'num_batches_tracked' in key:
+            continue
+        key_to_layer[key] = key.rsplit('.', 1)[0] if '.' in key else key
+    return sorted(set(key_to_layer.values())), key_to_layer
+
+
+def layer_forward_order(net, layer_names, input_shape=(1, 3, 32, 32)):
+    """Order logical layers by when they actually execute in a forward pass.
+
+    Alphabetical order is wrong for anything that talks about "first"/"last"
+    layers: a ResNet's classifier head `fc` sorts near the front, ahead of every
+    layerN.* block. One hooked forward pass recovers the true order.
+    """
+    order = {}
+    counter = {'n': 0}
+    handles = []
+
+    def make_hook(name):
+        def hook(_m, _i, _o):
+            if name not in order:
+                order[name] = counter['n']
+                counter['n'] += 1
+        return hook
+
+    for name, module in net.named_modules():
+        if name:
+            handles.append(module.register_forward_hook(make_hook(name)))
+
+    was_training = net.training
+    net.eval()
+    try:
+        device = next(net.parameters()).device
+        with torch.no_grad():
+            net(torch.zeros(*input_shape, device=device))
+    finally:
+        for h in handles:
+            h.remove()
+        net.train(was_training)
+
+    def position(layer_name):
+        prefix = layer_name + '.'
+        hits = [p for m, p in order.items() if m == layer_name or m.startswith(prefix)]
+        return (min(hits) if hits else len(order) + 1, layer_name)
+
+    return sorted(layer_names, key=position)
+
+
+def resolve_layer_selection(net, param_keys, policy):
+    """Layer names a policy permits to be transmitted.
+
+    policy: 'full' | 'first_<k>' | 'last_<k>', taken in forward-execution order.
+    """
+    layer_names, key_to_layer = build_layer_groups(param_keys)
+    if policy in (None, '', 'full'):
+        return set(layer_names), key_to_layer
+
+    ordered = layer_forward_order(net, layer_names)
+    kind, _, k_str = policy.partition('_')
+    if kind not in ('first', 'last') or not k_str.isdigit():
+        raise ValueError("layer policy must be 'full', 'first_<k>' or 'last_<k>', got %r" % policy)
+    k = int(k_str)
+    if not 1 <= k <= len(ordered):
+        raise ValueError('policy %r selects %d of %d layers' % (policy, k, len(ordered)))
+    chosen = ordered[:k] if kind == 'first' else ordered[-k:]
+    return set(chosen), key_to_layer
+
+
+def standard_aggregate(args, client_models, network_topology, param_keys,
+                       client_thresholds, sample_nums, allowed_layers, key_to_layer):
+    """This repo's original DecFus aggregation pass, lifted verbatim out of the
+    round loop so family B can substitute a different one without an early
+    `continue` skipping the variance/cutoff update that follows it.
+
+    The single behavioural addition is the restricted-layer guard; with
+    `allowed_layers=None` (the default, 'full' policy) this is byte-identical to
+    the original code.
+    """
+    new_client_models = []
+    for idx in range(args.num_users):
+        neighbors = network_topology[idx + 1]
+        current_model = client_models[idx]
+        new_model = copy.deepcopy(current_model)
+
+        # Use the stored cutoff (only updated every test_round rounds)
+        individual_threshold = client_thresholds[idx]
+
+        # For each parameter tensor, find the least similar neighbor
+        lowest_similarities = []
+
+        for param_name in param_keys:
+            if 'num_batches_tracked' in param_name:
+                continue
+
+            param_similarities = []
+            for neighbor in neighbors:
+                neighbor_model = client_models[neighbor - 1]
+                similarity = compute_parameter_similarity(
+                    current_model[param_name],
+                    neighbor_model[param_name]
+                )
+                param_similarities.append({
+                    'neighbor': neighbor,
+                    'param_name': param_name,
+                    'similarity': similarity
+                })
+
+            lowest_sim_item = min(param_similarities, key=lambda x: x['similarity'])
+            lowest_similarities.append(lowest_sim_item)
+
+        if lowest_similarities:
+            similarity_values = [item['similarity'] for item in lowest_similarities]
+            threshold = np.percentile(similarity_values, individual_threshold * 100)
+
+            for sim_item in lowest_similarities:
+                neighbor = sim_item['neighbor']
+                param_name = sim_item['param_name']
+                similarity = sim_item['similarity']
+
+                # Restricted layer exchange: a tensor whose logical layer is not
+                # permitted is left alone. `new_model` started as a deepcopy of
+                # this client's own state, so skipping here is exactly "keep the
+                # locally trained tensor" -- no path can carry a peer's value in.
+                # Similarities and the percentile threshold are still computed
+                # over *all* layers, matching how the reproduced repo masks its V
+                # after construction rather than before.
+                if allowed_layers is not None and key_to_layer.get(param_name) not in allowed_layers:
+                    continue
+
+                if similarity > threshold:
+                    # Above the cutoff: average with all neighbors, sample-weighted.
+                    weighted_param = current_model[param_name].clone() * sample_nums[idx]
+                    total_samples = sample_nums[idx]
+
+                    for n in neighbors:
+                        weighted_param += client_models[n - 1][param_name].clone() * sample_nums[n - 1]
+                        total_samples += sample_nums[n - 1]
+
+                    new_model[param_name] = weighted_param / total_samples
+                else:
+                    if random.random() < args.exchange_prob:
+                        new_model[param_name] = client_models[neighbor - 1][param_name].clone()
+                    else:
+                        possible_choices = [idx]
+                        for n in neighbors:
+                            if n != neighbor:
+                                possible_choices.append(n - 1)
+
+                        random_idx = random.choice(possible_choices)
+                        if random_idx == idx:
+                            new_model[param_name] = current_model[param_name].clone()
+                        else:
+                            new_model[param_name] = client_models[random_idx][param_name].clone()
+
+        new_client_models.append(new_model)
+    return new_client_models
+
+
+def hybrid_aggregate(args, client_models, network_topology, topology_meta,
+                     param_keys, client_thresholds, allowed_layers, key_to_layer):
+    """Experiment family B, in this codebase's idiom.
+
+    Stage 1 -- every client averages with its intra-cluster neighbours only; the
+    bridge edge is excluded. Uses the plain unweighted mean this repo's own
+    DFLAvg uses (note: NOT the sample-count weighting its DecFus P-group uses,
+    and NOT the Metropolis-Hastings weighting the reproduced repo uses -- these
+    are genuinely different averaging rules and the comparison should say so).
+
+    Stage 2 -- only the two hubs, and only with each other, run DecFus's
+    similarity-based fusion, on the *post-stage-1* states.
+
+    Returns the new client model list.
+    """
+    hubs = [h - 1 for h in topology_meta['hubs']]  # 0-indexed
+    hub_a, hub_b = hubs[0], hubs[1]
+
+    # ---- stage 1: intra-cluster plain averaging ----
+    stage1 = []
+    for idx in range(args.num_users):
+        peers = [n - 1 for n in network_topology[idx + 1]]
+        # Drop the bridge: hub-to-hub traffic is stage 2's business.
+        peers = [p for p in peers if not (idx in hubs and p in hubs)]
+        members = [idx] + peers
+        averaged = copy.deepcopy(client_models[idx])
+        for key in averaged.keys():
+            if averaged[key].dtype in (torch.int32, torch.int64, torch.bool):
+                continue
+            acc = torch.zeros_like(averaged[key], dtype=torch.float32)
+            for m in members:
+                acc += client_models[m][key].float()
+            averaged[key] = (acc / len(members)).to(averaged[key].dtype)
+        stage1.append(averaged)
+
+    # ---- stage 2: DecFus across the bridge, hubs only ----
+    new_models = [copy.deepcopy(m) for m in stage1]
+    for i, peer in ((hub_a, hub_b), (hub_b, hub_a)):
+        sims = []
+        for param_name in param_keys:
+            if 'num_batches_tracked' in param_name:
+                continue
+            sims.append({
+                'param_name': param_name,
+                'similarity': compute_parameter_similarity(
+                    stage1[i][param_name], stage1[peer][param_name]),
+            })
+        if not sims:
+            continue
+        threshold = np.percentile([s['similarity'] for s in sims],
+                                  client_thresholds[i] * 100)
+        for item in sims:
+            param_name = item['param_name']
+            if allowed_layers is not None and key_to_layer.get(param_name) not in allowed_layers:
+                continue  # blocked layer: hub keeps its stage-1 result
+            if item['similarity'] > threshold:
+                # Two-node average across the bridge.
+                a = stage1[i][param_name].float()
+                b = stage1[peer][param_name].float()
+                new_models[i][param_name] = ((a + b) / 2.0).to(stage1[i][param_name].dtype)
+            else:
+                if random.random() < args.exchange_prob:
+                    new_models[i][param_name] = stage1[peer][param_name].clone()
+                # Otherwise the only remaining choice is itself (there are no
+                # other stage-2 neighbours), i.e. keep the stage-1 value.
+    return new_models
+
+
 def compute_parameter_similarity(param1, param2):
     """Cosine similarity between two parameter tensors."""
     if torch.is_tensor(param1) and torch.is_tensor(param2):
@@ -191,7 +505,7 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
         ))
 
     # Network topology
-    network_topology = {
+    FIXED_TOPOLOGY = {
         1: [2, 8, 9, 5],
         2: [1, 6, 10, 3],
         3: [2, 8, 10, 4],
@@ -203,6 +517,25 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
         9: [8, 7, 1, 6],
         10: [2, 3, 4, 5]
     }
+    if args.topology == 'two_cluster':
+        # Two equal clusters, genuine intra-cluster circulant wiring, one
+        # guaranteed degree-1 leaf per cluster, single hub-to-hub bridge.
+        network_topology, topology_meta = build_two_cluster_topology(args.num_users)
+    elif args.topology == 'bridge':
+        # Two-cluster "bridge" topology, generalized to any even args.num_users
+        # (originally added, and still hardcoded at N=10 in build_bridge_topology's
+        # docstring example, for the N=10 comparison against our own reproduction):
+        # clients 1,2 are hubs (degree leaves_per_hub+1 -- leaves_per_hub
+        # same-cluster leaves each + one hub-hub bridge edge), the rest are leaves
+        # (degree 1), split evenly between the two hubs. Every path between the two
+        # clusters must cross the single 1-2 edge. Matches our own reproduction's
+        # decfus/topology/registry.py:bridge_topology(n) node-for-node (hub_a=1,
+        # hub_b=2, leaves_a=3..2+leaves_per_hub, leaves_b=3+leaves_per_hub..n).
+        network_topology = build_bridge_topology(args.num_users)
+        topology_meta = None
+    else:
+        network_topology = FIXED_TOPOLOGY
+        topology_meta = None
 
     # Initialize client models and sample counts
     client_models = []
@@ -213,6 +546,32 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
 
     param_keys = list(client_models[0].keys())
     current_lr = args.lr
+
+    # Restricted layer exchange (experiment family C). 'full' leaves the
+    # original behaviour untouched: allowed_layers is None and the guard in the
+    # update loop is never taken.
+    layer_policy = getattr(args, 'layer_policy', 'full')
+    layer_scope = getattr(args, 'layer_scope', 'all')
+    if layer_policy in (None, '', 'full'):
+        allowed_layers, key_to_layer = None, {}
+    else:
+        if layer_scope != 'all':
+            # The averaging branch below mixes over *all* neighbours at once, so
+            # restricting a single edge would mean rebuilding that average
+            # without the bridge peer rather than skipping the tensor. Not
+            # implemented here; refusing beats silently doing the wrong thing.
+            raise NotImplementedError(
+                "layer_scope='%s' is not implemented in this codebase; only 'all' is "
+                "supported (the reproduced repo supports 'bridge')." % layer_scope
+            )
+        allowed_layers, key_to_layer = resolve_layer_selection(net_glob, param_keys, layer_policy)
+        print('[DecFus] layer policy %r -> %d/%d layers exchangeable: %s' % (
+            layer_policy, len(allowed_layers),
+            len(build_layer_groups(param_keys)[0]), sorted(allowed_layers)))
+
+    hub_indices = set()
+    if topology_meta:
+        hub_indices = {h - 1 for h in topology_meta['hubs']}  # 0-indexed
 
     # Per-client cutoff values
     client_thresholds = [args.initial_threshold] * args.num_users
@@ -252,83 +611,21 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
             loss.append(avg_loss)
             train_loss.append(avg_train_loss)
 
-        # Similarity-based adaptive aggregation
-        new_client_models = []
-        for idx in range(args.num_users):
-            neighbors = network_topology[idx + 1]
-            current_model = client_models[idx]
-            new_model = copy.deepcopy(current_model)
-
-            # Use the stored cutoff (only updated every test_round rounds)
-            individual_threshold = client_thresholds[idx]
-
-            # For each parameter tensor, find the least similar neighbor
-            lowest_similarities = []
-
-            for param_name in param_keys:
-                if 'num_batches_tracked' in param_name:
-                    continue
-
-                # Similarity between this tensor and the same tensor of every neighbor
-                param_similarities = []
-                for neighbor in neighbors:
-                    neighbor_model = client_models[neighbor - 1]
-                    similarity = compute_parameter_similarity(
-                        current_model[param_name],
-                        neighbor_model[param_name]
-                    )
-                    param_similarities.append({
-                        'neighbor': neighbor,
-                        'param_name': param_name,
-                        'similarity': similarity
-                    })
-
-                # Neighbor with the lowest similarity
-                lowest_sim_item = min(param_similarities, key=lambda x: x['similarity'])
-                lowest_similarities.append(lowest_sim_item)
-
-            if lowest_similarities:
-                # Similarity cutoff value from this client's own cutoff percentile
-                similarity_values = [item['similarity'] for item in lowest_similarities]
-                threshold = np.percentile(similarity_values, individual_threshold * 100)
-
-                # Update parameters
-                for sim_item in lowest_similarities:
-                    neighbor = sim_item['neighbor']
-                    param_name = sim_item['param_name']
-                    similarity = sim_item['similarity']
-
-                    if similarity > threshold:
-                        # Similarity above the cutoff: average with all neighbors, weighted by sample count
-                        weighted_param = current_model[param_name].clone() * sample_nums[idx]
-                        total_samples = sample_nums[idx]
-
-                        for n in neighbors:
-                            weighted_param += client_models[n - 1][param_name].clone() * sample_nums[n - 1]
-                            total_samples += sample_nums[n - 1]
-
-                        new_model[param_name] = weighted_param / total_samples
-                    else:
-                        if random.random() < args.exchange_prob:  # with probability exchange_prob (default 0.4)
-                            # take the tensor from the least similar neighbor
-                            new_model[param_name] = client_models[neighbor - 1][param_name].clone()
-                        else:  # otherwise (default 0.6)
-                            # pick uniformly among itself and the remaining neighbors
-                            possible_choices = [idx]
-                            for n in neighbors:
-                                if n != neighbor:
-                                    possible_choices.append(n - 1)
-
-                            random_idx = random.choice(possible_choices)
-                            if random_idx == idx:
-                                new_model[param_name] = current_model[param_name].clone()
-                            else:
-                                new_model[param_name] = client_models[random_idx][param_name].clone()
-
-            new_client_models.append(new_model)
-
-        # Update client models
-        client_models = new_client_models
+        # Aggregation. Family B replaces the standard pass entirely; everything
+        # after this point (variance detection, cutoff update, logging) runs
+        # identically either way -- which is why this is an if/else rather than
+        # an early `continue`, as skipping ahead would freeze the DCD cutoff at
+        # its initial value for the whole run.
+        if getattr(args, 'hybrid', False):
+            if not topology_meta:
+                raise ValueError('--hybrid requires --topology two_cluster')
+            client_models = hybrid_aggregate(
+                args, client_models, network_topology, topology_meta,
+                param_keys, client_thresholds, allowed_layers, key_to_layer)
+        else:
+            client_models = standard_aggregate(
+                args, client_models, network_topology, param_keys,
+                client_thresholds, sample_nums, allowed_layers, key_to_layer)
 
         # After aggregation, compute the variance and update the cutoff
         if iter % args.test_round == 0:
