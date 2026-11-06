@@ -80,5 +80,13 @@ def args_parser():
     parser.add_argument('--exchange_prob', type=float, default=0.4,
                         help='probability that a low-similarity parameter is taken from the least similar neighbor')
 
+    # Communication instrumentation (off by default; adds no cost when unset).
+    parser.add_argument('--comm_log', action='store_true',
+                        help='record per-tensor aggregation modes to counts.npz')
+    parser.add_argument('--comm_log_dir', type=str, default='./output/comm',
+                        help='parent directory for communication logs')
+    parser.add_argument('--run_id', type=str, default='',
+                        help='subdirectory name for this run under --comm_log_dir')
+
     args = parser.parse_args()
     return args

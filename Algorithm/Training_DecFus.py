@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch import nn
 import copy
+import os
 import numpy as np
 import random
 import swanlab
@@ -311,7 +312,8 @@ def resolve_layer_selection(net, param_keys, policy):
 
 
 def standard_aggregate(args, client_models, network_topology, param_keys,
-                       client_thresholds, sample_nums, allowed_layers, key_to_layer):
+                       client_thresholds, sample_nums, allowed_layers, key_to_layer,
+                       recorder=None):
     """This repo's original DecFus aggregation pass, lifted verbatim out of the
     round loop so family B can substitute a different one without an early
     `continue` skipping the variance/cutoff update that follows it.
@@ -369,6 +371,8 @@ def standard_aggregate(args, client_models, network_topology, param_keys,
                 # over *all* layers, matching how the reproduced repo masks its V
                 # after construction rather than before.
                 if allowed_layers is not None and key_to_layer.get(param_name) not in allowed_layers:
+                    if recorder is not None:
+                        recorder.record_blocked(idx, param_name)
                     continue
 
                 if similarity > threshold:
@@ -381,9 +385,14 @@ def standard_aggregate(args, client_models, network_topology, param_keys,
                         total_samples += sample_nums[n - 1]
 
                     new_model[param_name] = weighted_param / total_samples
+                    if recorder is not None:
+                        recorder.record_average(idx, param_name,
+                                                [idx] + [n - 1 for n in neighbors])
                 else:
                     if random.random() < args.exchange_prob:
                         new_model[param_name] = client_models[neighbor - 1][param_name].clone()
+                        if recorder is not None:
+                            recorder.record_exchange(idx, param_name, neighbor - 1)
                     else:
                         possible_choices = [idx]
                         for n in neighbors:
@@ -395,13 +404,20 @@ def standard_aggregate(args, client_models, network_topology, param_keys,
                             new_model[param_name] = current_model[param_name].clone()
                         else:
                             new_model[param_name] = client_models[random_idx][param_name].clone()
+                        # `possible_choices` starts with idx itself -- this is the
+                        # include-self fallback pool, and the reason a degree-1 leaf
+                        # here can retain its own tensor where the reproduced repo's
+                        # exclude_self pool cannot.
+                        if recorder is not None:
+                            recorder.record_exchange(idx, param_name, random_idx)
 
         new_client_models.append(new_model)
     return new_client_models
 
 
 def hybrid_aggregate(args, client_models, network_topology, topology_meta,
-                     param_keys, client_thresholds, allowed_layers, key_to_layer):
+                     param_keys, client_thresholds, allowed_layers, key_to_layer,
+                     recorder=None):
     """Experiment family B, in this codebase's idiom.
 
     Stage 1 -- every client averages with its intra-cluster neighbours only; the
@@ -433,6 +449,12 @@ def hybrid_aggregate(args, client_models, network_topology, topology_meta,
             for m in members:
                 acc += client_models[m][key].float()
             averaged[key] = (acc / len(members)).to(averaged[key].dtype)
+            # Stage 1 and stage 2 are recorded separately, never as a composed
+            # matrix: composing them manufactures direct edges that no client
+            # ever used (a hub would appear to receive from the far cluster's
+            # leaves).
+            if recorder is not None and 'num_batches_tracked' not in key:
+                recorder.record_average(idx, key, members)
         stage1.append(averaged)
 
     # ---- stage 2: DecFus across the bridge, hubs only ----
@@ -454,15 +476,25 @@ def hybrid_aggregate(args, client_models, network_topology, topology_meta,
         for item in sims:
             param_name = item['param_name']
             if allowed_layers is not None and key_to_layer.get(param_name) not in allowed_layers:
+                if recorder is not None:
+                    recorder.record_blocked(i, param_name)
                 continue  # blocked layer: hub keeps its stage-1 result
             if item['similarity'] > threshold:
                 # Two-node average across the bridge.
                 a = stage1[i][param_name].float()
                 b = stage1[peer][param_name].float()
                 new_models[i][param_name] = ((a + b) / 2.0).to(stage1[i][param_name].dtype)
+                if recorder is not None:
+                    recorder.record_average(i, param_name, [i, peer])
+                    recorder.note_bridge_event()
             else:
                 if random.random() < args.exchange_prob:
                     new_models[i][param_name] = stage1[peer][param_name].clone()
+                    if recorder is not None:
+                        recorder.record_exchange(i, param_name, peer)
+                        recorder.note_bridge_event()
+                elif recorder is not None:
+                    recorder.record_exchange(i, param_name, i)  # logged as kept_own
                 # Otherwise the only remaining choice is itself (there are no
                 # other stage-2 neighbours), i.e. keep the stage-1 value.
     return new_models
@@ -576,6 +608,36 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
     # Per-client cutoff values
     client_thresholds = [args.initial_threshold] * args.num_users
 
+    # Communication instrumentation (opt-in; `None` leaves every aggregation
+    # path byte-identical to the original code).
+    recorder = None
+    if getattr(args, 'comm_log', False):
+        from Algorithm.comm_log import CommunicationRecorder
+        _, recorder_key_to_layer = build_layer_groups(param_keys)
+        run_id = getattr(args, 'run_id', '') or '%s_%s_%s_n%d' % (
+            args.algorithm, args.model, args.topology, args.num_users)
+        recorder = CommunicationRecorder(
+            out_dir=os.path.join(getattr(args, 'comm_log_dir', './output/comm'), run_id),
+            num_users=args.num_users,
+            param_keys=param_keys,
+            key_to_layer=recorder_key_to_layer,
+            meta={
+                'run_id': run_id,
+                'algorithm': args.algorithm,
+                'model': args.model,
+                'dataset': args.dataset,
+                'topology': args.topology,
+                'hybrid': bool(getattr(args, 'hybrid', False)),
+                'layer_policy': layer_policy,
+                'layer_scope': layer_scope,
+                'exchange_prob': args.exchange_prob,
+                'data_beta': getattr(args, 'data_beta', None),
+                'total_rounds': args.epochs,
+                'hubs': sorted(h + 1 for h in hub_indices) if hub_indices else None,
+                'exchange_fallback_pool': 'include_self',
+            },
+        )
+
     # Main training loop
     for iter in range(args.epochs):
         print('*' * 80)
@@ -621,11 +683,15 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
                 raise ValueError('--hybrid requires --topology two_cluster')
             client_models = hybrid_aggregate(
                 args, client_models, network_topology, topology_meta,
-                param_keys, client_thresholds, allowed_layers, key_to_layer)
+                param_keys, client_thresholds, allowed_layers, key_to_layer,
+                recorder=recorder)
         else:
             client_models = standard_aggregate(
                 args, client_models, network_topology, param_keys,
-                client_thresholds, sample_nums, allowed_layers, key_to_layer)
+                client_thresholds, sample_nums, allowed_layers, key_to_layer,
+                recorder=recorder)
+        if recorder is not None:
+            recorder.end_round(iter)
 
         # After aggregation, compute the variance and update the cutoff
         if iter % args.test_round == 0:
@@ -699,6 +765,8 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
             swanlab.log(log_dict)
 
     # Save results
+    if recorder is not None:
+        recorder.save()
     save_result(acc, 'test_acc', args)
     save_result(loss, 'test_loss', args)
     save_result(train_loss, 'test_train_loss', args)
