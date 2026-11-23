@@ -176,6 +176,36 @@ def build_bridge_topology(n: int) -> dict:
     return topo
 
 
+def build_graph_file_topology(path, n):
+    """Load a clustered graph from the JSON the reproduced repo writes
+    (`decfus.topology.draw.graph_summary`), as 1-indexed `(topology, meta)`.
+
+    Used for `--topology four_cluster`: that graph is drawn at random, so it is
+    generated once on the other side and read here, which keeps every method
+    under comparison on identical wiring. Client ids in the file are 0-indexed;
+    this repo is 1-indexed, hence the shift. `meta['clusters']` carries the
+    cluster label of every client and is all that hybrid aggregation needs --
+    there are no named hubs, any client with an inter-cluster link is a gateway.
+    """
+    import json
+    with open(path) as f:
+        g = json.load(f)
+    if g['num_clients'] != n:
+        raise ValueError("topology file %s has %d clients but --num_users is %d"
+                         % (path, g['num_clients'], n))
+    adj = {i: set() for i in range(1, n + 1)}
+    for a, b in g['adjacency_edges']:
+        adj[a + 1].add(b + 1)
+        adj[b + 1].add(a + 1)
+    topo = {i: sorted(adj[i]) for i in range(1, n + 1)}
+    meta = {
+        'clusters': {i + 1: g['cluster_of'][i] for i in range(n)},
+        'seed': g.get('seed'),
+        'num_isolated': sum(1 for i in topo if not topo[i]),
+    }
+    return topo, meta
+
+
 def build_two_cluster_topology(n=20):
     """Two equal star clusters joined by a single hub-to-hub bridge
     (1-indexed client ids, this repo's convention).
@@ -328,6 +358,18 @@ def standard_aggregate(args, client_models, network_topology, param_keys,
         current_model = client_models[idx]
         new_model = copy.deepcopy(current_model)
 
+        if not neighbors:
+            # An isolated client (possible on the random four_cluster graph) has
+            # nobody to compare with or exchange with, so it keeps its own model.
+            # Without this the `min()` over its empty neighbour list below raises.
+            # Logged as kept_own for every tensor, i.e. a decision that moved nothing.
+            if recorder is not None:
+                for param_name in param_keys:
+                    if 'num_batches_tracked' not in param_name:
+                        recorder.record_exchange(idx, param_name, idx)
+            new_client_models.append(new_model)
+            continue
+
         # Use the stored cutoff (only updated every test_round rounds)
         individual_threshold = client_thresholds[idx]
 
@@ -420,26 +462,40 @@ def hybrid_aggregate(args, client_models, network_topology, topology_meta,
                      recorder=None):
     """Experiment family B, in this codebase's idiom.
 
-    Stage 1 -- every client averages with its intra-cluster neighbours only; the
-    bridge edge is excluded. Uses the plain unweighted mean this repo's own
+    Stage 1 -- every client averages with its intra-cluster neighbours only; every
+    inter-cluster edge is excluded. Uses the plain unweighted mean this repo's own
     DFLAvg uses (note: NOT the sample-count weighting its DecFus P-group uses,
     and NOT the Metropolis-Hastings weighting the reproduced repo uses -- these
     are genuinely different averaging rules and the comparison should say so).
 
-    Stage 2 -- only the two hubs, and only with each other, run DecFus's
-    similarity-based fusion, on the *post-stage-1* states.
+    Stage 2 -- only *gateways* (clients with at least one inter-cluster
+    neighbour), and only over their inter-cluster neighbours, run DecFus's
+    similarity-based fusion on the *post-stage-1* states. On `two_cluster` the
+    single bridge is the only inter-cluster edge, so the gateways are the two hubs
+    with one peer each and this is exactly the original two-hub scheme, down to
+    the order and number of random draws. On `four_cluster` any client can be a
+    gateway, and one gateway can have several peers: the similarity of a tensor is
+    then its minimum over those peers (as `standard_aggregate` does over all
+    neighbours), the above-cutoff branch averages over the gateway and all its
+    peers, and the exchange fallback draws among the gateway itself and its other
+    peers. Clients without an inter-cluster link pass stage 1 straight through.
 
     Returns the new client model list.
     """
-    hubs = [h - 1 for h in topology_meta['hubs']]  # 0-indexed
-    hub_a, hub_b = hubs[0], hubs[1]
+    clusters = topology_meta['clusters']  # 1-indexed client id -> cluster label
+
+    def inter_peers(idx):
+        return [n - 1 for n in network_topology[idx + 1] if clusters[n] != clusters[idx + 1]]
+
+    # Ascending id: on two_cluster that is hub A then hub B, the original order.
+    gateways = [idx for idx in range(args.num_users) if inter_peers(idx)]
 
     # ---- stage 1: intra-cluster plain averaging ----
     stage1 = []
     for idx in range(args.num_users):
         peers = [n - 1 for n in network_topology[idx + 1]]
-        # Drop the bridge: hub-to-hub traffic is stage 2's business.
-        peers = [p for p in peers if not (idx in hubs and p in hubs)]
+        # Drop every inter-cluster edge: that traffic is stage 2's business.
+        peers = [p for p in peers if clusters[p + 1] == clusters[idx + 1]]
         members = [idx] + peers
         averaged = copy.deepcopy(client_models[idx])
         for key in averaged.keys():
@@ -451,23 +507,29 @@ def hybrid_aggregate(args, client_models, network_topology, topology_meta,
             averaged[key] = (acc / len(members)).to(averaged[key].dtype)
             # Stage 1 and stage 2 are recorded separately, never as a composed
             # matrix: composing them manufactures direct edges that no client
-            # ever used (a hub would appear to receive from the far cluster's
-            # leaves).
+            # ever used (a gateway would appear to receive from the far cluster's
+            # other members).
             if recorder is not None and 'num_batches_tracked' not in key:
                 recorder.record_average(idx, key, members)
         stage1.append(averaged)
 
-    # ---- stage 2: DecFus across the bridge, hubs only ----
+    # ---- stage 2: DecFus across inter-cluster edges, gateways only ----
     new_models = [copy.deepcopy(m) for m in stage1]
-    for i, peer in ((hub_a, hub_b), (hub_b, hub_a)):
+    for i in gateways:
+        peers = inter_peers(i)
         sims = []
         for param_name in param_keys:
             if 'num_batches_tracked' in param_name:
                 continue
+            # Least similar inter-cluster peer for this tensor.
+            similarity, least_similar = min(
+                ((compute_parameter_similarity(stage1[i][param_name], stage1[p][param_name]), p)
+                 for p in peers),
+                key=lambda x: x[0])
             sims.append({
                 'param_name': param_name,
-                'similarity': compute_parameter_similarity(
-                    stage1[i][param_name], stage1[peer][param_name]),
+                'similarity': similarity,
+                'peer': least_similar,
             })
         if not sims:
             continue
@@ -475,17 +537,21 @@ def hybrid_aggregate(args, client_models, network_topology, topology_meta,
                                   client_thresholds[i] * 100)
         for item in sims:
             param_name = item['param_name']
+            peer = item['peer']
             if allowed_layers is not None and key_to_layer.get(param_name) not in allowed_layers:
                 if recorder is not None:
                     recorder.record_blocked(i, param_name)
-                continue  # blocked layer: hub keeps its stage-1 result
+                continue  # blocked layer: gateway keeps its stage-1 result
             if item['similarity'] > threshold:
-                # Two-node average across the bridge.
-                a = stage1[i][param_name].float()
-                b = stage1[peer][param_name].float()
-                new_models[i][param_name] = ((a + b) / 2.0).to(stage1[i][param_name].dtype)
+                # Uniform average over the gateway and all its inter-cluster peers
+                # (with one peer: the original two-node mean).
+                total = stage1[i][param_name].float()
+                for p in peers:
+                    total = total + stage1[p][param_name].float()
+                new_models[i][param_name] = (total / float(len(peers) + 1)).to(
+                    stage1[i][param_name].dtype)
                 if recorder is not None:
-                    recorder.record_average(i, param_name, [i, peer])
+                    recorder.record_average(i, param_name, [i] + peers)
                     recorder.note_bridge_event()
             else:
                 if random.random() < args.exchange_prob:
@@ -493,10 +559,18 @@ def hybrid_aggregate(args, client_models, network_topology, topology_meta,
                     if recorder is not None:
                         recorder.record_exchange(i, param_name, peer)
                         recorder.note_bridge_event()
-                elif recorder is not None:
-                    recorder.record_exchange(i, param_name, i)  # logged as kept_own
-                # Otherwise the only remaining choice is itself (there are no
-                # other stage-2 neighbours), i.e. keep the stage-1 value.
+                else:
+                    # Fallback pool: the gateway itself plus its other peers. With a
+                    # single peer the pool is just the gateway, so nothing is drawn
+                    # (keeps the original two-hub random stream untouched).
+                    pool = [i] + [p for p in peers if p != peer]
+                    pick = random.choice(pool) if len(pool) > 1 else i
+                    if pick != i:
+                        new_models[i][param_name] = stage1[pick][param_name].clone()
+                        if recorder is not None:
+                            recorder.note_bridge_event()
+                    if recorder is not None:
+                        recorder.record_exchange(i, param_name, pick)  # pick == i: kept_own
     return new_models
 
 
@@ -565,6 +639,13 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
         # hub_b=2, leaves_a=3..2+leaves_per_hub, leaves_b=3+leaves_per_hub..n).
         network_topology = build_bridge_topology(args.num_users)
         topology_meta = None
+    elif args.topology == 'four_cluster':
+        # Random 4-cluster graph, generated by the reproduced repo and read from
+        # a file so every method runs on the same wiring.
+        if not getattr(args, 'topology_file', ''):
+            raise ValueError('--topology four_cluster requires --topology_file')
+        network_topology, topology_meta = build_graph_file_topology(
+            args.topology_file, args.num_users)
     else:
         network_topology = FIXED_TOPOLOGY
         topology_meta = None
@@ -603,7 +684,7 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
 
     hub_indices = set()
     if topology_meta:
-        hub_indices = {h - 1 for h in topology_meta['hubs']}  # 0-indexed
+        hub_indices = {h - 1 for h in topology_meta.get('hubs', [])}  # 0-indexed
 
     # Per-client cutoff values
     client_thresholds = [args.initial_threshold] * args.num_users
@@ -635,6 +716,8 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
                 'total_rounds': args.epochs,
                 'hubs': sorted(h + 1 for h in hub_indices) if hub_indices else None,
                 'exchange_fallback_pool': 'include_self',
+                'topology_file': getattr(args, 'topology_file', '') or None,
+                'topology_seed': (topology_meta or {}).get('seed'),
             },
         )
 
@@ -680,7 +763,7 @@ def DecFus(args, net_glob, dataset_train, dataset_test, dict_users):
         # its initial value for the whole run.
         if getattr(args, 'hybrid', False):
             if not topology_meta:
-                raise ValueError('--hybrid requires --topology two_cluster')
+                raise ValueError('--hybrid requires --topology two_cluster or four_cluster')
             client_models = hybrid_aggregate(
                 args, client_models, network_topology, topology_meta,
                 param_keys, client_thresholds, allowed_layers, key_to_layer,

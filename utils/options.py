@@ -34,7 +34,7 @@ def args_parser():
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: 1)')
     parser.add_argument("--test_round", type=int, default=5)
     parser.add_argument('--topology', type=str, default='fixed',
-                        choices=['fixed', 'bridge', 'two_cluster'],
+                        choices=['fixed', 'bridge', 'two_cluster', 'four_cluster'],
                         help="communication graph for the decentralized algorithms (DecFus/DFLAvg/DFLMR): "
                              "'fixed' is this repo's original hardcoded 10-client graph (every client "
                              "degree 4); 'bridge' is a two-cluster topology -- clients 1,2 are hubs "
@@ -42,6 +42,13 @@ def args_parser():
                              "are hub-1's leaves (degree 1), clients 7-10 are hub-2's leaves (degree 1) "
                              "-- added to test whether this topology's known failure mode in our own "
                              "reproduction reproduces against the authors' own implementation.")
+
+    parser.add_argument('--topology_file', type=str, default='',
+                        help="JSON graph for --topology four_cluster, as written by the reproduced "
+                             "repo's decfus.topology.draw.graph_summary (adjacency_edges, cluster_of, "
+                             "num_clients). The graph is random, so it is generated once there and "
+                             "loaded here: every method under comparison then runs on the same wiring, "
+                             "and the seed it was drawn with travels in the file.")
 
     # DFLMR arguments
     parser.add_argument("--first_stage_bound", type=int, default=0)
@@ -76,7 +83,7 @@ def args_parser():
     parser.add_argument('--hybrid', action='store_true',
                         help='experiment family B: plain averaging inside each cluster, with '
                              'DecFus fusion applied only on the hub-to-hub bridge edge. '
-                             'Requires --topology two_cluster.')
+                             'Requires --topology two_cluster or four_cluster.')
     parser.add_argument('--exchange_prob', type=float, default=0.4,
                         help='probability that a low-similarity parameter is taken from the least similar neighbor')
 
